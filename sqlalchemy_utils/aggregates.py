@@ -388,6 +388,7 @@ class AggregatedAttribute(declared_attr):
         fget,
         relationship,
         column,
+        update_after,
         *args,
         **kwargs
     ):
@@ -395,9 +396,10 @@ class AggregatedAttribute(declared_attr):
         self.__doc__ = fget.__doc__
         self.column = column
         self.relationship = relationship
+        self.update_after = update_after
 
     def __get__(desc, self, cls):
-        value = (desc.fget, desc.relationship, desc.column)
+        value = (desc.fget, desc.relationship, desc.column, desc.update_after)
         if cls not in aggregated_attrs:
             aggregated_attrs[cls] = [value]
         else:
@@ -437,11 +439,12 @@ def aggregate_expression(expr, class_):
 
 
 class AggregatedValue(object):
-    def __init__(self, class_, attr, relationships, expr):
+    def __init__(self, class_, attr, relationships, expr, update_after):
         self.class_ = class_
         self.attr = attr
         self.relationships = relationships
         self.expr = aggregate_expression(expr, class_)
+        self.update_after = update_after
 
     @property
     def aggregate_query(self):
@@ -499,6 +502,9 @@ class AggregationManager(object):
 
     def reset(self):
         self.generator_registry = defaultdict(list)
+        self.session_factory = None
+        self.already_committing = False
+        self.queries_to_commit = []
 
     def register_listeners(self):
         sa.event.listen(
@@ -511,10 +517,20 @@ class AggregationManager(object):
             'after_flush',
             self.construct_aggregate_queries
         )
+        sa.event.listen(
+            sa.orm.session.Session,
+            'after_commit',
+            self.on_commit
+        )
+        sa.event.listen(
+            sa.orm.session.Session,
+            'after_commit',
+            self.on_rollback
+        )
 
     def update_generator_registry(self):
         for class_, attrs in six.iteritems(aggregated_attrs):
-            for expr, relationship, column in attrs:
+            for expr, relationship, column, update_after in attrs:
                 relationships = []
                 rel_class = class_
 
@@ -528,7 +544,8 @@ class AggregationManager(object):
                         class_=class_,
                         attr=column,
                         relationships=list(reversed(relationships)),
-                        expr=expr(class_)
+                        expr=expr(class_),
+                        update_after=update_after
                     )
                 )
 
@@ -543,7 +560,34 @@ class AggregationManager(object):
             for aggregate_value in self.generator_registry[class_]:
                 query = aggregate_value.update_query(objects)
                 if query is not None:
-                    session.execute(query)
+                    if aggregate_value.update_after == 'commit':
+                        self.queries_to_commit.append(query)
+                    else:
+                        session.execute(query)
+
+    def on_commit(self, session):
+        if self.already_committing or not self.session_factory:
+            return
+
+        self.already_committing = True
+
+        new_session = None
+        try:
+            new_session = self.session_factory()
+            for query in self.queries_to_commit:
+                new_session.execute(query)
+            new_session.commit()
+        except:
+            if new_session:
+                new_session.rollback()
+        finally:
+            if new_session:
+                new_session.close()
+            self.already_committing = False
+            self.queries_to_commit = []
+
+    def on_rollback(self, session):
+        self.queries_to_commit = []
 
 
 manager = AggregationManager()
@@ -552,7 +596,8 @@ manager.register_listeners()
 
 def aggregated(
     relationship,
-    column
+    column,
+    update_after='flush',
 ):
     """
     Decorator that generates an aggregated attribute. The decorated function
@@ -565,11 +610,15 @@ def aggregated(
     :param column:
         SQLAlchemy Column object. The column definition of this aggregate
         attribute.
+    :param update_after:
+        Sets whether the aggregate is calculated after `flush` or after
+        `commit`. Default is after flush.
     """
     def wraps(func):
         return AggregatedAttribute(
             func,
             relationship,
-            column
+            column,
+            update_after
         )
     return wraps
